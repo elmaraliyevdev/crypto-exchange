@@ -1,0 +1,1 @@
+"""Cryptocurrency exchange application package."""

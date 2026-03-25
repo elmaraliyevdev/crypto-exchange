@@ -1,0 +1,85 @@
+# Crypto Exchange Backend — Cursor Rules
+
+## Project Overview
+FastAPI cryptocurrency exchange backend with a limit order matching engine.
+Stack: FastAPI · PostgreSQL (asyncpg) · Redis · Celery · Alembic · Pytest · Docker Compose
+
+## Domain Rules (read carefully)
+- A trading pair is BASE/QUOTE (e.g. BTC/USDT). Base is the asset being bought/sold; USDT is settlement.
+- A limit order executes at the specified price or better.
+- Order book: bids (buy orders) sorted highest-price-first; asks (sell orders) sorted lowest-price-first.
+- A match occurs when highest bid price >= lowest ask price. Trade executes at the MAKER's price.
+- Maker = the order already sitting in the book. Taker = the incoming new order.
+
+## Balance Invariant — NEVER violate this
+- Wallet has two fields: `available` and `reserved`. Total = available + reserved.
+- When a BUY order is placed: lock (price * quantity) USDT from available → reserved.
+- When a SELL order is placed: lock quantity of base currency from available → reserved.
+- When an order is FILLED: deduct from reserved, credit the received asset to available.
+- When an order is CANCELLED: move funds from reserved back to available.
+- NEVER allow available or reserved to go negative. Raise an error instead.
+
+## Architecture — strictly follow this
+- `app/api/v1/endpoints/` — route handlers only. Thin: validate input → call service → return schema.
+- `app/services/` — all business logic lives here. Services own DB transactions.
+- `app/models/` — SQLAlchemy ORM models (SQLAlchemy 2.0 mapped_column style).
+- `app/schemas/` — Pydantic v2 request/response schemas. Never expose ORM models directly.
+- `app/tasks/` — Celery tasks (matching engine). POST /orders enqueues a task; HTTP returns immediately.
+- `app/core/` — config, security (JWT), dependencies (FastAPI Depends).
+- `app/db/` — engine, session factory, base declarative class.
+
+## Coding Rules
+1. All DB operations are async (asyncpg + SQLAlchemy async session).
+2. Services use `async with session.begin()` for transactions. Never commit inside route handlers.
+3. Matching engine runs as a Celery background task — never block the HTTP response.
+4. Use `SELECT FOR UPDATE` when reading orders/wallets inside the matching task to prevent race conditions.
+5. JWT: access token (15 min) + refresh token (7 days). Store refresh token hash in Redis.
+6. All endpoints except /auth/register and /auth/login require JWT authentication.
+7. Return HTTP 400 for business logic errors (insufficient balance, invalid pair, etc).
+8. Return HTTP 404 when a resource is not found. Return HTTP 403 when a user tries to act on another user's resource.
+
+## Naming Conventions
+- Files: snake_case.py
+- ORM Models: PascalCase (User, Order, Trade, Wallet)
+- DB columns: snake_case
+- Schemas: {Model}{Action} pattern — e.g. OrderCreate, OrderResponse, WalletDeposit
+- Endpoints: kebab-case paths — e.g. /order-book, /trade-history
+
+## Testing
+- Use pytest + pytest-asyncio.
+- Unit tests mock the DB session.
+- Integration tests use a real test Postgres DB, set up via fixtures.
+- Cover every critical flow: register, login, deposit, place order, match, cancel, withdraw.
+- Never test implementation details — test behavior and outcomes.
+
+## Docker / Environment
+- Never hardcode secrets. All config via environment variables.
+- .env is git-ignored. .env.example is committed with placeholder values.
+- Services: app, db (postgres:16), redis (redis:7), worker (Celery), flower (optional monitoring).
+- Alembic migrations run automatically on app container startup.
+
+## What to always do when generating code
+- When creating a new endpoint: also create the service function and Pydantic schemas for it.
+- When modifying an ORM model: remind me to generate an Alembic migration.
+- When touching any balance logic: explicitly check the balance invariant holds.
+- When creating a Celery task: make it safe to retry (idempotent).
+
+### SQLAlchemy async session transactions
+Never use `async with db.begin()` if any awaited DB call (like `db.execute(select(...))`)
+has already been made on the same session — SQLAlchemy auto-begins a transaction on the
+first operation. Pattern to follow for read-then-write operations:
+  1. Do reads on the open session (no explicit begin)
+  2. Raise any validation errors before writing
+  3. Use `async with db.begin()` only if the session has NO prior operations,
+     OR call `await db.rollback()` first to reset the session state.
+  Preferred pattern: use `session.begin()` at the service entry point once,
+  do all reads and writes inside it, and raise errors before any writes.
+
+### bcrypt / passlib compatibility
+Do NOT use passlib. Use the `bcrypt` package directly (bcrypt>=4.0.0).
+Password hashing in security.py:
+  import bcrypt
+  def hash_password(password: str) -> str:
+      return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+  def verify_password(plain: str, hashed: str) -> bool:
+      return bcrypt.checkpw(plain.encode(), hashed.encode())
